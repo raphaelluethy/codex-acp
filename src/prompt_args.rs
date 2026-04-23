@@ -1,10 +1,120 @@
 /// Mostly copied from `codex_tui::bottom_pane::prompt_args`: <https://github.com/zed-industries/codex/blob/9baf30493dd9f531af1e4dc49a781654b1b2c966/codex-rs/tui/src/bottom_pane/prompt_args.rs#L1>
-use codex_protocol::custom_prompts::CustomPrompt;
 use regex_lite::Regex;
 use shlex::Shlex;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomPrompt {
+    pub name: String,
+    pub path: PathBuf,
+    pub content: String,
+    pub description: Option<String>,
+    pub argument_hint: Option<String>,
+}
+
+pub fn discover_custom_prompts_in(dir: &Path) -> Vec<CustomPrompt> {
+    let mut out = Vec::new();
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_md = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
+        if !is_md || !path.is_file() {
+            continue;
+        }
+
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        let Ok(content) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let (description, argument_hint, content) = parse_frontmatter(&content);
+        out.push(CustomPrompt {
+            name,
+            path,
+            content,
+            description,
+            argument_hint,
+        });
+    }
+
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+fn parse_frontmatter(content: &str) -> (Option<String>, Option<String>, String) {
+    let mut segments = content.split_inclusive('\n');
+    let Some(first_segment) = segments.next() else {
+        return (None, None, String::new());
+    };
+    let first_line = first_segment.trim_end_matches(['\r', '\n']);
+    if first_line.trim() != "---" {
+        return (None, None, content.to_string());
+    }
+
+    let mut description = None;
+    let mut argument_hint = None;
+    let mut frontmatter_closed = false;
+    let mut consumed = first_segment.len();
+
+    for segment in segments {
+        let line = segment.trim_end_matches(['\r', '\n']);
+        let trimmed = line.trim();
+
+        if trimmed == "---" {
+            frontmatter_closed = true;
+            consumed += segment.len();
+            break;
+        }
+
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            consumed += segment.len();
+            continue;
+        }
+
+        if let Some((key, value)) = trimmed.split_once(':') {
+            let key = key.trim().to_ascii_lowercase();
+            let mut value = value.trim().to_string();
+            if value.len() >= 2 {
+                let bytes = value.as_bytes();
+                let first = bytes[0];
+                let last = bytes[bytes.len() - 1];
+                if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+                    value = value[1..value.len().saturating_sub(1)].to_string();
+                }
+            }
+
+            match key.as_str() {
+                "description" => description = Some(value),
+                "argument-hint" | "argument_hint" => argument_hint = Some(value),
+                _ => {}
+            }
+        }
+
+        consumed += segment.len();
+    }
+
+    if !frontmatter_closed {
+        return (None, None, content.to_string());
+    }
+
+    let body = if consumed >= content.len() {
+        String::new()
+    } else {
+        content[consumed..].to_string()
+    };
+    (description, argument_hint, body)
+}
 
 static PROMPT_ARG_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\$[A-Z][A-Z0-9_]*").unwrap_or_else(|_| std::process::abort()));
@@ -311,5 +421,33 @@ mod tests {
 
         let out = expand_custom_prompt("my-prompt", "", &prompts).unwrap();
         assert_eq!(out, Some("literal $$USER".to_string()));
+    }
+
+    #[test]
+    fn discover_custom_prompts_reads_markdown_frontmatter() {
+        let dir = std::env::temp_dir().join(format!(
+            "codex-acp-prompts-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("review-fix.md"),
+            "---\ndescription: Review fix\nargument-hint: ISSUE=123\n---\nFix $ISSUE",
+        )
+        .unwrap();
+        fs::write(dir.join("ignored.txt"), "ignored").unwrap();
+
+        let prompts = discover_custom_prompts_in(&dir);
+        fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].name, "review-fix");
+        assert_eq!(prompts[0].description.as_deref(), Some("Review fix"));
+        assert_eq!(prompts[0].argument_hint.as_deref(), Some("ISSUE=123"));
+        assert_eq!(prompts[0].content, "Fix $ISSUE");
     }
 }

@@ -45,6 +45,7 @@ pub async fn run_main(
     })?;
 
     let config_overrides = ConfigOverrides {
+        codex_self_exe: std::env::current_exe().ok(),
         codex_linux_sandbox_exe,
         ..ConfigOverrides::default()
     };
