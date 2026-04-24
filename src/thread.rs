@@ -32,7 +32,7 @@ use codex_login::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
     approvals::{ElicitationRequest, ElicitationRequestEvent, GuardianAssessmentAction},
-    config_types::TrustLevel,
+    config_types::{ApprovalsReviewer, ServiceTier, TrustLevel},
     dynamic_tools::{DynamicToolCallOutputContentItem, DynamicToolCallRequest},
     error::CodexErr,
     mcp::CallToolResult,
@@ -2773,6 +2773,15 @@ impl<A: Auth> ThreadActor<A> {
                 "summarize conversation to prevent hitting the context limit",
             ),
             AvailableCommand::new("undo", "undo Codex’s most recent turn"),
+            AvailableCommand::new(
+                "fast",
+                "toggle Fast mode to enable fastest inference when available",
+            )
+            .input(AvailableCommandInput::Unstructured(
+                UnstructuredCommandInput::new("on|off|status"),
+            )),
+            AvailableCommand::new("auto-review", "route approval requests through auto review"),
+            AvailableCommand::new("manual-review", "route approval requests to the user"),
             AvailableCommand::new("logout", "logout of Codex"),
         ]
     }
@@ -2852,6 +2861,21 @@ impl<A: Auth> ThreadActor<A> {
         Some((model.to_owned(), reasoning))
     }
 
+    fn current_approvals_reviewer_id(&self) -> &'static str {
+        match self.config.approvals_reviewer {
+            ApprovalsReviewer::User => "user",
+            ApprovalsReviewer::AutoReview => "auto_review",
+        }
+    }
+
+    fn current_service_tier_id(&self) -> &'static str {
+        match self.config.service_tier {
+            None => "standard",
+            Some(ServiceTier::Fast) => "fast",
+            Some(ServiceTier::Flex) => "flex",
+        }
+    }
+
     async fn config_options(&self) -> Result<Vec<SessionConfigOption>, Error> {
         let mut options = Vec::new();
 
@@ -2873,6 +2897,40 @@ impl<A: Auth> ThreadActor<A> {
                 .description("Choose an approval and sandboxing preset for your session"),
             );
         }
+
+        options.push(
+            SessionConfigOption::select(
+                "approvals_reviewer",
+                "Approval Reviewer",
+                self.current_approvals_reviewer_id(),
+                vec![
+                    SessionConfigSelectOption::new("user", "Ask Me")
+                        .description("Route approval requests to the user"),
+                    SessionConfigSelectOption::new("auto_review", "Auto Review")
+                        .description("Let Codex review approval requests automatically"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Mode)
+            .description("Choose who reviews approval requests"),
+        );
+
+        options.push(
+            SessionConfigOption::select(
+                "service_tier",
+                "Speed",
+                self.current_service_tier_id(),
+                vec![
+                    SessionConfigSelectOption::new("standard", "Standard")
+                        .description("Use the default service tier"),
+                    SessionConfigSelectOption::new("fast", "Fast")
+                        .description("Use fastest inference when available"),
+                    SessionConfigSelectOption::new("flex", "Flex")
+                        .description("Use flex service tier when available"),
+                ],
+            )
+            .category(SessionConfigOptionCategory::Model)
+            .description("Choose the service tier for future turns"),
+        );
 
         let presets = self.models_manager.list_models().await;
 
@@ -2977,10 +3035,76 @@ impl<A: Auth> ThreadActor<A> {
         };
         match config_id.0.as_ref() {
             "mode" => self.handle_set_mode(SessionModeId::new(value.0)).await,
+            "approvals_reviewer" => self.handle_set_approvals_reviewer(value).await,
+            "service_tier" => self.handle_set_service_tier(value).await,
             "model" => self.handle_set_config_model(value).await,
             "reasoning_effort" => self.handle_set_config_reasoning_effort(value).await,
             _ => Err(Error::invalid_params().data("Unsupported config option")),
         }
+    }
+
+    async fn handle_set_approvals_reviewer(
+        &mut self,
+        value: SessionConfigValueId,
+    ) -> Result<(), Error> {
+        let reviewer = match value.0.as_ref() {
+            "user" => ApprovalsReviewer::User,
+            "auto_review" | "guardian_subagent" => ApprovalsReviewer::AutoReview,
+            _ => return Err(Error::invalid_params().data("Unsupported approval reviewer")),
+        };
+
+        self.thread
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                permission_profile: None,
+                model: None,
+                effort: None,
+                summary: None,
+                collaboration_mode: None,
+                personality: None,
+                windows_sandbox_level: None,
+                service_tier: None,
+                approvals_reviewer: Some(reviewer),
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.approvals_reviewer = reviewer;
+
+        Ok(())
+    }
+
+    async fn handle_set_service_tier(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
+        let service_tier = match value.0.as_ref() {
+            "standard" | "off" => None,
+            "fast" | "on" => Some(ServiceTier::Fast),
+            "flex" => Some(ServiceTier::Flex),
+            _ => return Err(Error::invalid_params().data("Unsupported service tier")),
+        };
+
+        self.thread
+            .submit(Op::OverrideTurnContext {
+                cwd: None,
+                approval_policy: None,
+                sandbox_policy: None,
+                permission_profile: None,
+                model: None,
+                effort: None,
+                summary: None,
+                collaboration_mode: None,
+                personality: None,
+                windows_sandbox_level: None,
+                service_tier: Some(service_tier),
+                approvals_reviewer: None,
+            })
+            .await
+            .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+
+        self.config.service_tier = service_tier;
+
+        Ok(())
     }
 
     async fn handle_set_config_model(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
@@ -3137,6 +3261,26 @@ impl<A: Auth> ThreadActor<A> {
             match name {
                 "compact" => op = Op::Compact,
                 "undo" => op = Op::Undo,
+                "fast" => {
+                    self.handle_fast_slash(rest).await?;
+                    self.maybe_emit_config_options_update().await;
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
+                }
+                "auto-review" => {
+                    self.handle_set_approvals_reviewer(SessionConfigValueId::new("auto_review"))
+                        .await?;
+                    self.maybe_emit_config_options_update().await;
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
+                }
+                "manual-review" => {
+                    self.handle_set_approvals_reviewer(SessionConfigValueId::new("user"))
+                        .await?;
+                    self.maybe_emit_config_options_update().await;
+                    drop(response_tx.send(Ok(StopReason::EndTurn)));
+                    return Ok(response_rx);
+                }
                 "init" => {
                     op = Op::UserInput {
                         items: vec![UserInput::Text {
@@ -3244,6 +3388,25 @@ impl<A: Auth> ThreadActor<A> {
         self.submissions.insert(submission_id, state);
 
         Ok(response_rx)
+    }
+
+    async fn handle_fast_slash(&mut self, rest: &str) -> Result<(), Error> {
+        let value = match rest.trim() {
+            "" => {
+                if matches!(self.config.service_tier, Some(ServiceTier::Fast)) {
+                    "standard"
+                } else {
+                    "fast"
+                }
+            }
+            "on" => "fast",
+            "off" => "standard",
+            "status" => return Ok(()),
+            _ => return Err(Error::invalid_params().data("Usage: /fast [on|off|status]")),
+        };
+
+        self.handle_set_service_tier(SessionConfigValueId::new(value))
+            .await
     }
 
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
