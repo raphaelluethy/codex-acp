@@ -65,9 +65,9 @@ use codex_protocol::{
         McpToolCallEndEvent, ModelRerouteEvent, NetworkApprovalContext, NetworkPolicyRuleAction,
         Op, PatchApplyBeginEvent, PatchApplyEndEvent, PatchApplyStatus, PatchApplyUpdatedEvent,
         ReasoningContentDeltaEvent, ReasoningRawContentDeltaEvent, ReviewDecision,
-        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, SandboxPolicy,
-        StreamErrorEvent, TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent,
-        TokenCountEvent, TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
+        ReviewOutputEvent, ReviewRequest, ReviewTarget, RolloutItem, StreamErrorEvent,
+        TerminalInteractionEvent, ThreadGoalStatus, ThreadGoalUpdatedEvent, TokenCountEvent,
+        TurnAbortedEvent, TurnCompleteEvent, TurnStartedEvent, UserMessageEvent,
         ViewImageToolCallEvent, WarningEvent, WebSearchBeginEvent, WebSearchEndEvent,
     },
     request_permissions::{
@@ -3048,6 +3048,9 @@ impl<A: Auth> ThreadActor<A> {
             .input(AvailableCommandInput::Unstructured(
                 UnstructuredCommandInput::new("on|off|status"),
             )),
+            AvailableCommand::new("goal", "set or view the goal for a long-running task").input(
+                AvailableCommandInput::Unstructured(UnstructuredCommandInput::new("objective")),
+            ),
             AvailableCommand::new("auto-review", "route approval requests through auto review"),
             AvailableCommand::new("manual-review", "route approval requests to the user"),
             AvailableCommand::new("logout", "logout of Codex"),
@@ -3108,9 +3111,8 @@ impl<A: Auth> ThreadActor<A> {
 
     fn current_service_tier_id(&self) -> &'static str {
         match self.config.service_tier {
-            None => "standard",
+            None | Some(ServiceTier::Flex) => "standard",
             Some(ServiceTier::Fast) => "fast",
-            Some(ServiceTier::Flex) => "flex",
         }
     }
 
@@ -3162,8 +3164,6 @@ impl<A: Auth> ThreadActor<A> {
                         .description("Use the default service tier"),
                     SessionConfigSelectOption::new("fast", "Fast")
                         .description("Use fastest inference when available"),
-                    SessionConfigSelectOption::new("flex", "Flex")
-                        .description("Use flex service tier when available"),
                 ],
             )
             .category(SessionConfigOptionCategory::Model)
@@ -3317,7 +3317,6 @@ impl<A: Auth> ThreadActor<A> {
         let service_tier = match value.0.as_ref() {
             "standard" | "off" => None,
             "fast" | "on" => Some(ServiceTier::Fast),
-            "flex" => Some(ServiceTier::Flex),
             _ => return Err(Error::invalid_params().data("Unsupported service tier")),
         };
 
@@ -5045,6 +5044,54 @@ mod tests {
                         branch: "feature".to_owned()
                     },
                 }
+            }],
+            "ops don't match {ops:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_goal_command_is_forwarded_as_user_input() -> anyhow::Result<()> {
+        let (session_id, client, thread, message_tx, _handle) = setup().await?;
+        let (prompt_response_tx, prompt_response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::Prompt {
+            request: PromptRequest::new(
+                session_id.clone(),
+                vec!["/goal improve benchmark coverage".into()],
+            ),
+            response_tx: prompt_response_tx,
+        })?;
+
+        let stop_reason = prompt_response_rx.await??.await??;
+        assert_eq!(stop_reason, StopReason::EndTurn);
+        drop(message_tx);
+
+        let notifications = client.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 1);
+        assert!(
+            matches!(
+                &notifications[0].update,
+                SessionUpdate::AgentMessageChunk(ContentChunk {
+                    content: ContentBlock::Text(TextContent { text, .. }),
+                    ..
+                }) if text == "/goal improve benchmark coverage"
+            ),
+            "notifications don't match {notifications:?}"
+        );
+
+        let ops = thread.ops.lock().unwrap();
+        assert_eq!(
+            ops.as_slice(),
+            &[Op::UserInput {
+                items: vec![UserInput::Text {
+                    text: "/goal improve benchmark coverage".to_string(),
+                    text_elements: vec![]
+                }],
+                final_output_json_schema: None,
+                environments: None,
+                responsesapi_client_metadata: None,
             }],
             "ops don't match {ops:?}"
         );
