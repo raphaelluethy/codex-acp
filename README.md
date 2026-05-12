@@ -2,7 +2,16 @@
 
 Use [Codex](https://github.com/openai/codex) from [ACP-compatible](https://agentclientprotocol.com) clients such as [Zed](https://zed.dev)!
 
-This tool implements an ACP adapter around the Codex CLI, supporting:
+This repository is a fork of the upstream [Zed Codex ACP adapter](https://github.com/zed-industries/codex-acp). It tracks upstream while carrying a small patch stack that exposes selected features from the Codex CLI and Codex desktop/app experience through ACP.
+
+Local fork additions include:
+
+- Session controls for fast inference and approval-review routing
+- Live ACP tool-call updates for Codex collaboration/sub-agent events
+- Replay support for persisted collaboration tool calls
+- `/goal` command exposure for long-running task goals
+
+The adapter implements an ACP bridge around the Codex CLI, supporting:
 
 - Context @-mentions
 - Images
@@ -16,6 +25,7 @@ This tool implements an ACP adapter around the Codex CLI, supporting:
   - /review-commit
   - /init
   - /compact
+  - /goal
   - /logout
   - Custom Prompts
 - Client MCP servers
