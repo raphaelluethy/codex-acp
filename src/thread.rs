@@ -119,12 +119,15 @@ const INIT_COMMAND_PROMPT: &str = include_str!("./prompt_for_init_command.md");
 const CODEX_READ_ONLY_PROFILE_ID: &str = ":read-only";
 const CODEX_WORKSPACE_PROFILE_ID: &str = ":workspace";
 const CODEX_DANGER_NO_SANDBOX_PROFILE_ID: &str = ":danger-no-sandbox";
+const MODE_DEFAULT_PERMISSIONS: &str = "auto";
+const MODE_AUTO_REVIEW: &str = "auto-review";
+const MODE_FULL_ACCESS: &str = "full-access";
 
 fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> {
     match profile_id {
         CODEX_READ_ONLY_PROFILE_ID => Some("read-only"),
-        CODEX_WORKSPACE_PROFILE_ID => Some("auto"),
-        CODEX_DANGER_NO_SANDBOX_PROFILE_ID => Some("full-access"),
+        CODEX_WORKSPACE_PROFILE_ID => Some(MODE_DEFAULT_PERMISSIONS),
+        CODEX_DANGER_NO_SANDBOX_PROFILE_ID => Some(MODE_FULL_ACCESS),
         _ => None,
     }
 }
@@ -132,8 +135,8 @@ fn session_mode_id_for_active_profile(profile_id: &str) -> Option<&'static str> 
 fn active_profile_id_for_session_mode(mode_id: &str) -> Option<&'static str> {
     match mode_id {
         "read-only" => Some(CODEX_READ_ONLY_PROFILE_ID),
-        "auto" => Some(CODEX_WORKSPACE_PROFILE_ID),
-        "full-access" => Some(CODEX_DANGER_NO_SANDBOX_PROFILE_ID),
+        MODE_DEFAULT_PERMISSIONS | MODE_AUTO_REVIEW => Some(CODEX_WORKSPACE_PROFILE_ID),
+        MODE_FULL_ACCESS => Some(CODEX_DANGER_NO_SANDBOX_PROFILE_ID),
         _ => None,
     }
 }
@@ -209,11 +212,39 @@ fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
 }
 
 fn current_session_mode_id_for_selector(config: &Config) -> SessionModeId {
-    current_session_mode_id(config).unwrap_or_else(|| SessionModeId::new("auto"))
+    match current_session_mode_id(config)
+        .as_ref()
+        .map(|mode| mode.0.as_ref())
+    {
+        Some(MODE_FULL_ACCESS) => SessionModeId::new(MODE_FULL_ACCESS),
+        Some(MODE_DEFAULT_PERMISSIONS)
+            if config.approvals_reviewer == ApprovalsReviewer::AutoReview =>
+        {
+            SessionModeId::new(MODE_AUTO_REVIEW)
+        }
+        _ => SessionModeId::new(MODE_DEFAULT_PERMISSIONS),
+    }
 }
 
 fn mode_trusts_project(mode_id: &str) -> bool {
-    matches!(mode_id, "auto" | "full-access")
+    matches!(
+        mode_id,
+        MODE_DEFAULT_PERMISSIONS | MODE_AUTO_REVIEW | MODE_FULL_ACCESS
+    )
+}
+
+fn app_session_modes() -> Vec<SessionMode> {
+    vec![
+        SessionMode::new(MODE_DEFAULT_PERMISSIONS, "Default permissions").description(
+            "Codex can read and edit files in the current workspace, and asks before network access or edits outside the workspace.",
+        ),
+        SessionMode::new(MODE_AUTO_REVIEW, "Auto-review").description(
+            "Use default permissions and let Codex review approval requests automatically.",
+        ),
+        SessionMode::new(MODE_FULL_ACCESS, "Full access").description(
+            "Codex can edit files outside this workspace and access the internet without asking for approval.",
+        ),
+    ]
 }
 
 /// Trait for abstracting over the `CodexThread` to make testing easier.
@@ -3181,15 +3212,7 @@ impl<A: Auth> ThreadActor<A> {
     fn modes(&self) -> Option<SessionModeState> {
         let current_mode_id = current_session_mode_id_for_selector(&self.config);
 
-        Some(SessionModeState::new(
-            current_mode_id,
-            APPROVAL_PRESETS
-                .iter()
-                .map(|preset| {
-                    SessionMode::new(preset.id, preset.label).description(preset.description)
-                })
-                .collect(),
-        ))
+        Some(SessionModeState::new(current_mode_id, app_session_modes()))
     }
 
     async fn find_current_model(&self) -> Option<ModelId> {
@@ -3223,13 +3246,6 @@ impl<A: Auth> ThreadActor<A> {
         Some((model.to_owned(), reasoning))
     }
 
-    fn current_approvals_reviewer_id(&self) -> &'static str {
-        match self.config.approvals_reviewer {
-            ApprovalsReviewer::User => "user",
-            ApprovalsReviewer::AutoReview => "auto_review",
-        }
-    }
-
     fn current_service_tier_id(&self) -> &'static str {
         match self.config.service_tier.as_deref() {
             Some("fast") => "fast",
@@ -3258,22 +3274,6 @@ impl<A: Auth> ThreadActor<A> {
                 .description("Choose an approval and sandboxing preset for your session"),
             );
         }
-
-        options.push(
-            SessionConfigOption::select(
-                "approvals_reviewer",
-                "Approval Reviewer",
-                self.current_approvals_reviewer_id(),
-                vec![
-                    SessionConfigSelectOption::new("user", "Ask Me")
-                        .description("Route approval requests to the user"),
-                    SessionConfigSelectOption::new("auto_review", "Auto Review")
-                        .description("Let Codex review approval requests automatically"),
-                ],
-            )
-            .category(SessionConfigOptionCategory::Mode)
-            .description("Choose who reviews approval requests"),
-        );
 
         options.push(
             SessionConfigOption::select(
@@ -3760,9 +3760,16 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
+        let (preset_id, reviewer) = match mode.0.as_ref() {
+            MODE_DEFAULT_PERMISSIONS => (MODE_DEFAULT_PERMISSIONS, ApprovalsReviewer::User),
+            MODE_AUTO_REVIEW => (MODE_DEFAULT_PERMISSIONS, ApprovalsReviewer::AutoReview),
+            MODE_FULL_ACCESS => (MODE_FULL_ACCESS, ApprovalsReviewer::User),
+            _ => return Err(Error::invalid_params().data("Unsupported mode")),
+        };
+
         let preset = APPROVAL_PRESETS
             .iter()
-            .find(|preset| mode.0.as_ref() == preset.id)
+            .find(|preset| preset_id == preset.id)
             .ok_or_else(Error::invalid_params)?;
 
         self.thread
@@ -3778,7 +3785,7 @@ impl<A: Auth> ThreadActor<A> {
                 personality: None,
                 windows_sandbox_level: None,
                 service_tier: None,
-                approvals_reviewer: None,
+                approvals_reviewer: Some(reviewer),
             })
             .await
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
@@ -3795,6 +3802,7 @@ impl<A: Auth> ThreadActor<A> {
                 active_profile_id_for_session_mode(preset.id).map(ActivePermissionProfile::new),
             )
             .map_err(|e| Error::from(anyhow::anyhow!(e)))?;
+        self.config.approvals_reviewer = reviewer;
 
         if mode_trusts_project(preset.id) {
             set_project_trust_level(
@@ -5219,6 +5227,42 @@ mod tests {
         assert_eq!(mode_id.0.as_ref(), "full-access");
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn mode_selector_combines_default_permissions_with_auto_review() -> anyhow::Result<()> {
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config
+            .permissions
+            .approval_policy
+            .set(codex_protocol::protocol::AskForApproval::OnRequest)?;
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::workspace_write())?;
+        config.approvals_reviewer = ApprovalsReviewer::AutoReview;
+
+        assert_eq!(
+            current_session_mode_id_for_selector(&config).0.as_ref(),
+            MODE_AUTO_REVIEW
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn app_session_modes_match_codex_app_modes() {
+        let modes = app_session_modes();
+        assert_eq!(
+            modes
+                .iter()
+                .map(|mode| mode.id.0.as_ref())
+                .collect::<Vec<_>>(),
+            vec![MODE_DEFAULT_PERMISSIONS, MODE_AUTO_REVIEW, MODE_FULL_ACCESS]
+        );
     }
 
     #[tokio::test]
