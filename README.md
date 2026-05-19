@@ -10,6 +10,7 @@ Local fork additions include:
 - Live ACP tool-call updates for Codex collaboration/sub-agent events
 - Replay support for persisted collaboration tool calls
 - `/goal` command exposure for long-running task goals
+- Enabled Codex skills exposed as ACP slash commands
 
 The adapter implements an ACP bridge around the Codex CLI, supporting:
 
@@ -66,6 +67,16 @@ Or via npm:
 ```
 npx @zed-industries/codex-acp
 ```
+
+#### Building from source
+
+Build the optimized binary with:
+
+```
+cargo build --release
+```
+
+The binary is written to `target/release/codex-acp`. In the current dependency set, expect the release binary to be about 172 MB, `target/release` to be several GB, and the full `target` directory to be larger because it also includes debug and incremental build artifacts.
 
 ## License
 
