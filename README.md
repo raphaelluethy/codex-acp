@@ -27,6 +27,7 @@ The adapter implements an ACP bridge around the Codex CLI, supporting:
   - /compact
   - /goal
   - /logout
+  - Enabled Codex skills as slash commands
   - Custom Prompts
 - Client MCP servers
 - Auth Methods:

@@ -30,7 +30,9 @@ use codex_core::{
     config::{Config, set_project_trust_level},
     review_format::format_review_findings_block,
     review_prompts::user_facing_hint,
+    skills::{SkillLoadOutcome, SkillMetadata, SkillsLoadInput, SkillsManager},
 };
+use codex_core_plugins::PluginsManager;
 use codex_login::auth::AuthManager;
 use codex_models_manager::manager::{ModelsManager, RefreshStrategy};
 use codex_protocol::{
@@ -204,6 +206,10 @@ fn current_session_mode_id(config: &Config) -> Option<SessionModeId> {
     semantic_session_mode_id_for_permission_profile(config)
         .and_then(|mode_id| mode_id_if_approval_matches(mode_id, config))
         .or_else(|| untrusted_read_only_mode_id(config))
+}
+
+fn current_session_mode_id_for_selector(config: &Config) -> SessionModeId {
+    current_session_mode_id(config).unwrap_or_else(|| SessionModeId::new("auto"))
 }
 
 fn mode_trusts_project(mode_id: &str) -> bool {
@@ -2898,6 +2904,10 @@ struct ThreadActor<A> {
     config: Config,
     /// The models available for this thread.
     models_manager: Arc<dyn ModelsManagerImpl>,
+    /// The skills available for this thread.
+    skills_manager: Arc<SkillsManager>,
+    /// The plugins that can contribute skills for this thread.
+    plugins_manager: Arc<PluginsManager>,
     /// Internal message sender used to route spawned interaction results back to the actor.
     resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
     /// A sender for each interested `Op` submission that needs events routed.
@@ -2922,12 +2932,24 @@ impl<A: Auth> ThreadActor<A> {
         resolution_tx: mpsc::UnboundedSender<ThreadMessage>,
         resolution_rx: mpsc::UnboundedReceiver<ThreadMessage>,
     ) -> Self {
+        let skills_manager = Arc::new(SkillsManager::new_with_restriction_product(
+            config.codex_home.clone(),
+            config.bundled_skills_enabled(),
+            Some(codex_protocol::protocol::Product::Codex),
+        ));
+        let plugins_manager = Arc::new(PluginsManager::new_with_restriction_product(
+            config.codex_home.to_path_buf(),
+            Some(codex_protocol::protocol::Product::Codex),
+        ));
+
         Self {
             auth,
             client,
             thread,
             config,
             models_manager,
+            skills_manager,
+            plugins_manager,
             resolution_tx,
             submissions: HashMap::new(),
             message_rx,
@@ -2972,12 +2994,13 @@ impl<A: Auth> ThreadActor<A> {
                 let result = self.handle_load().await;
                 drop(response_tx.send(result));
                 let client = self.client.clone();
+                let commands = self.available_commands().await;
                 // Have this happen after the session is loaded by putting it
                 // in a separate task
                 tokio::spawn(async move {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                     client.send_notification(SessionUpdate::AvailableCommandsUpdate(
-                        AvailableCommandsUpdate::new(Self::builtin_commands()),
+                        AvailableCommandsUpdate::new(commands),
                     ));
                 });
             }
@@ -3093,8 +3116,70 @@ impl<A: Auth> ThreadActor<A> {
         ]
     }
 
+    async fn available_commands(&self) -> Vec<AvailableCommand> {
+        let mut commands = Self::builtin_commands();
+        let builtin_names = commands
+            .iter()
+            .map(|command| command.name.to_string())
+            .collect::<HashSet<_>>();
+
+        let outcome = self.load_skills().await;
+        for err in &outcome.errors {
+            warn!(
+                "failed to load skill {} for slash command exposure: {}",
+                err.path.display(),
+                err.message
+            );
+        }
+
+        commands.extend(outcome.skills.iter().filter_map(|skill| {
+            if !outcome.is_skill_enabled(skill)
+                || builtin_names.contains(&skill.name)
+                || !is_valid_slash_command_name(&skill.name)
+            {
+                return None;
+            }
+
+            Some(
+                AvailableCommand::new(skill.name.clone(), skill_description(skill)).input(
+                    AvailableCommandInput::Unstructured(UnstructuredCommandInput::new(
+                        "instructions",
+                    )),
+                ),
+            )
+        }));
+
+        commands
+    }
+
+    async fn load_skills(&self) -> SkillLoadOutcome {
+        let plugins_input = self.config.plugins_config_input();
+        let plugin_outcome = self
+            .plugins_manager
+            .plugins_for_config(&plugins_input)
+            .await;
+        let skills_input = SkillsLoadInput::new(
+            self.config.cwd.clone(),
+            plugin_outcome.effective_plugin_skill_roots(),
+            self.config.config_layer_stack.clone(),
+            self.config.bundled_skills_enabled(),
+        );
+        self.skills_manager
+            .skills_for_config(&skills_input, /* fs */ None)
+            .await
+    }
+
+    async fn find_slash_skill(&self, name: &str) -> Option<SkillMetadata> {
+        let outcome = self.load_skills().await;
+        outcome
+            .skills
+            .iter()
+            .find(|skill| skill.name == name && outcome.is_skill_enabled(skill))
+            .cloned()
+    }
+
     fn modes(&self) -> Option<SessionModeState> {
-        let current_mode_id = current_session_mode_id(&self.config)?;
+        let current_mode_id = current_session_mode_id_for_selector(&self.config);
 
         Some(SessionModeState::new(
             current_mode_id,
@@ -3608,11 +3693,20 @@ impl<A: Auth> ThreadActor<A> {
                     return Err(Error::auth_required());
                 }
                 _ => {
-                    op = Op::UserInput {
-                        items,
-                        final_output_json_schema: None,
-                        environments: None,
-                        responsesapi_client_metadata: None,
+                    if let Some(skill) = self.find_slash_skill(name).await {
+                        op = Op::UserInput {
+                            items: skill_slash_input(skill, rest),
+                            final_output_json_schema: None,
+                            environments: None,
+                            responsesapi_client_metadata: None,
+                        }
+                    } else {
+                        op = Op::UserInput {
+                            items,
+                            final_output_json_schema: None,
+                            environments: None,
+                            responsesapi_client_metadata: None,
+                        }
                     }
                 }
             }
@@ -4655,6 +4749,35 @@ fn extract_slash_command(content: &[UserInput]) -> Option<(&str, &str)> {
     Some((name, rest))
 }
 
+fn is_valid_slash_command_name(name: &str) -> bool {
+    !name.is_empty() && !name.chars().any(char::is_whitespace) && !name.contains('/')
+}
+
+fn skill_description(skill: &SkillMetadata) -> &str {
+    skill
+        .interface
+        .as_ref()
+        .and_then(|interface| interface.short_description.as_deref())
+        .or(skill.short_description.as_deref())
+        .unwrap_or(&skill.description)
+}
+
+fn skill_slash_input(skill: SkillMetadata, rest: &str) -> Vec<UserInput> {
+    let mut items = vec![UserInput::Skill {
+        name: skill.name,
+        path: skill.path_to_skills_md.to_path_buf(),
+    }];
+
+    if !rest.trim().is_empty() {
+        items.push(UserInput::Text {
+            text: rest.trim().to_string(),
+            text_elements: vec![],
+        });
+    }
+
+    items
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -4696,6 +4819,39 @@ mod tests {
                 .expect("tool call update should include raw_output"),
             other => panic!("expected ToolCallUpdate notification, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_skill_slash_input_builds_structured_skill_invocation() -> anyhow::Result<()> {
+        let skill = SkillMetadata {
+            name: "diagnose".to_string(),
+            description: "Debug a bug".to_string(),
+            short_description: None,
+            interface: None,
+            dependencies: None,
+            policy: None,
+            path_to_skills_md: PathBuf::from("/tmp/diagnose/SKILL.md").try_into()?,
+            scope: codex_protocol::protocol::SkillScope::User,
+            plugin_id: None,
+        };
+
+        let items = skill_slash_input(skill, "  failing test  ");
+
+        assert_eq!(
+            items,
+            vec![
+                UserInput::Skill {
+                    name: "diagnose".to_string(),
+                    path: PathBuf::from("/tmp/diagnose/SKILL.md"),
+                },
+                UserInput::Text {
+                    text: "failing test".to_string(),
+                    text_elements: vec![],
+                },
+            ]
+        );
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -5040,6 +5196,51 @@ mod tests {
 
         let mode_id = current_session_mode_id(&config).expect("mode should be recognized");
         assert_eq!(mode_id.0.as_ref(), "auto");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn modes_match_full_access_permission_profile() -> anyhow::Result<()> {
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config
+            .permissions
+            .approval_policy
+            .set(codex_protocol::protocol::AskForApproval::Never)?;
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::Disabled)?;
+
+        let mode_id = current_session_mode_id(&config).expect("mode should be recognized");
+        assert_eq!(mode_id.0.as_ref(), "full-access");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mode_selector_falls_back_when_config_is_not_a_builtin_preset() -> anyhow::Result<()> {
+        let mut config = Config::load_with_cli_overrides_and_harness_overrides(
+            vec![],
+            ConfigOverrides::default(),
+        )
+        .await?;
+        config
+            .permissions
+            .approval_policy
+            .set(codex_protocol::protocol::AskForApproval::Never)?;
+        config
+            .permissions
+            .set_permission_profile(PermissionProfile::read_only())?;
+
+        assert!(current_session_mode_id(&config).is_none());
+        assert_eq!(
+            current_session_mode_id_for_selector(&config).0.as_ref(),
+            "auto"
+        );
 
         Ok(())
     }
