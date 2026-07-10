@@ -3250,11 +3250,8 @@ impl<A: Auth> ThreadActor<A> {
         Some(SessionModeState::new(current_mode_id, app_session_modes()))
     }
 
-    fn current_service_tier_id(&self) -> &'static str {
-        match self.config.service_tier.as_deref() {
-            Some("fast") => "fast",
-            _ => "standard",
-        }
+    fn fast_mode_enabled(&self) -> bool {
+        self.config.service_tier.as_deref() == Some("fast")
     }
 
     async fn config_options(&self) -> Result<Vec<SessionConfigOption>, Error> {
@@ -3278,22 +3275,6 @@ impl<A: Auth> ThreadActor<A> {
                 .description("Choose an approval and sandboxing preset for your session"),
             );
         }
-
-        options.push(
-            SessionConfigOption::select(
-                "service_tier",
-                "Speed",
-                self.current_service_tier_id(),
-                vec![
-                    SessionConfigSelectOption::new("standard", "Standard")
-                        .description("Use the default service tier"),
-                    SessionConfigSelectOption::new("fast", "Fast")
-                        .description("Use fastest inference when available"),
-                ],
-            )
-            .category(SessionConfigOptionCategory::Model)
-            .description("Choose the service tier for future turns"),
-        );
 
         let presets = self
             .models_manager
@@ -3369,6 +3350,12 @@ impl<A: Auth> ThreadActor<A> {
             );
         }
 
+        options.push(
+            SessionConfigOption::boolean("service_tier", "Fast mode", self.fast_mode_enabled())
+                .category(SessionConfigOptionCategory::Model)
+                .description("1.5x speed, increased usage"),
+        );
+
         Ok(options)
     }
 
@@ -3396,13 +3383,19 @@ impl<A: Auth> ThreadActor<A> {
         config_id: SessionConfigId,
         value: SessionConfigOptionValue,
     ) -> Result<(), Error> {
+        if config_id.0.as_ref() == "service_tier" {
+            let SessionConfigOptionValue::Boolean { value } = value else {
+                return Err(Error::invalid_params().data("Fast mode must be a boolean"));
+            };
+            return self.handle_set_fast_mode(value).await;
+        }
+
         let SessionConfigOptionValue::ValueId { value } = value else {
             return Err(Error::invalid_params().data("Unsupported config option value"));
         };
         match config_id.0.as_ref() {
             "mode" => self.handle_set_mode(SessionModeId::new(value.0)).await,
             "approvals_reviewer" => self.handle_set_approvals_reviewer(value).await,
-            "service_tier" => self.handle_set_service_tier(value).await,
             "model" => self.handle_set_config_model(value).await,
             "reasoning_effort" => self.handle_set_config_reasoning_effort(value).await,
             _ => Err(Error::invalid_params().data("Unsupported config option")),
@@ -3434,12 +3427,8 @@ impl<A: Auth> ThreadActor<A> {
         Ok(())
     }
 
-    async fn handle_set_service_tier(&mut self, value: SessionConfigValueId) -> Result<(), Error> {
-        let service_tier = match value.0.as_ref() {
-            "standard" | "off" => None,
-            "fast" | "on" => Some("fast".to_string()),
-            _ => return Err(Error::invalid_params().data("Unsupported service tier")),
-        };
+    async fn handle_set_fast_mode(&mut self, enabled: bool) -> Result<(), Error> {
+        let service_tier = enabled.then(|| "fast".to_string());
 
         self.thread
             .submit(Op::ThreadSettings {
@@ -3694,22 +3683,15 @@ impl<A: Auth> ThreadActor<A> {
     }
 
     async fn handle_fast_slash(&mut self, rest: &str) -> Result<(), Error> {
-        let value = match rest.trim() {
-            "" => {
-                if self.config.service_tier.as_deref() == Some("fast") {
-                    "standard"
-                } else {
-                    "fast"
-                }
-            }
-            "on" => "fast",
-            "off" => "standard",
+        let enabled = match rest.trim() {
+            "" => !self.fast_mode_enabled(),
+            "on" => true,
+            "off" => false,
             "status" => return Ok(()),
             _ => return Err(Error::invalid_params().data("Usage: /fast [on|off|status]")),
         };
 
-        self.handle_set_service_tier(SessionConfigValueId::new(value))
-            .await
+        self.handle_set_fast_mode(enabled).await
     }
 
     async fn handle_set_mode(&mut self, mode: SessionModeId) -> Result<(), Error> {
@@ -4931,6 +4913,74 @@ mod tests {
         let ops = thread.ops.lock().unwrap();
         assert_eq!(ops.as_slice(), &[Op::Compact]);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_mode_config_is_boolean() -> anyhow::Result<()> {
+        let (_session_id, _client, _thread, message_tx, _handle) = setup().await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::GetConfigOptions { response_tx })?;
+
+        let options = response_rx.await??;
+        assert_eq!(
+            options.last().map(|option| option.id.0.as_ref()),
+            Some("service_tier"),
+            "Fast mode should be the rightmost config option",
+        );
+        let fast_mode = options
+            .iter()
+            .find(|option| option.id.0.as_ref() == "service_tier")
+            .expect("Fast mode config option should be present");
+        let fast_mode = serde_json::to_value(fast_mode)?;
+
+        assert_eq!(fast_mode["name"], "Fast mode");
+        assert_eq!(fast_mode["type"], "boolean");
+        assert_eq!(fast_mode["currentValue"], false);
+        assert!(fast_mode.get("options").is_none());
+
+        drop(message_tx);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fast_mode_boolean_sets_service_tier() -> anyhow::Result<()> {
+        let (_session_id, _client, thread, message_tx, _handle) = setup().await?;
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+
+        message_tx.send(ThreadMessage::SetConfigOption {
+            config_id: SessionConfigId::new("service_tier"),
+            value: SessionConfigOptionValue::boolean(true),
+            response_tx,
+        })?;
+
+        response_rx.await??;
+
+        {
+            let ops = thread.ops.lock().unwrap();
+            assert!(matches!(
+                ops.as_slice(),
+                [Op::ThreadSettings {
+                    thread_settings: ThreadSettingsOverrides {
+                        service_tier: Some(Some(service_tier)),
+                        ..
+                    },
+                }] if service_tier == "fast"
+            ));
+        }
+
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        message_tx.send(ThreadMessage::GetConfigOptions { response_tx })?;
+        let options = response_rx.await??;
+        let fast_mode = options
+            .iter()
+            .find(|option| option.id.0.as_ref() == "service_tier")
+            .expect("Fast mode config option should be present");
+
+        assert_eq!(serde_json::to_value(fast_mode)?["currentValue"], true);
+
+        drop(message_tx);
         Ok(())
     }
 

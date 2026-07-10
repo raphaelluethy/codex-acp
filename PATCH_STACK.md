@@ -32,7 +32,7 @@ Status: rebuilt.
 
 Behavior:
 
-- Adds ACP config options for approval reviewer and service tier.
+- Adds ACP config options for approval reviewer and Fast mode.
 - Exposes `/fast [on|off|status]`, `/auto-review`, and `/manual-review`.
 - Routes config-option changes through `Op::OverrideTurnContext`.
 - Keeps local `Config` state in sync after the override is accepted.
@@ -41,8 +41,7 @@ Rebuild notes:
 
 - The current upstream already has `Op::OverrideTurnContext` fields for `service_tier` and
   `approvals_reviewer`, so the patch now only adds ACP-facing controls.
-- The rebuilt speed selector intentionally exposes only `standard` and `fast`. The old `flex`
-  option was removed by the later local patch and is not restored.
+- Fast mode is exposed as an ACP boolean toggle and maps directly to the `fast` service tier.
 
 ### `d726109` - Live ACP tool calls for collab agent events
 
@@ -95,9 +94,9 @@ Behavior kept:
 
 Behavior kept from the service-tier adjustment:
 
-- ACP exposes only `standard` and `fast`.
-- Any non-`fast` service tier value is displayed as `standard`, because this ACP selector only
-  offers `standard` and `fast` in the current Codex dependency snapshot.
+- ACP exposes Fast mode as a boolean toggle.
+- The toggle is enabled only when the configured service tier is `fast`; every other service tier
+  value is displayed as disabled.
 
 Rebuild notes:
 
