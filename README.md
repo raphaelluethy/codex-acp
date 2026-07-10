@@ -1,5 +1,11 @@
 # ACP adapter for Codex
 
+> [!IMPORTANT]
+> Development is moving to [agentclientprotocol/codex-acp](https://github.com/agentclientprotocol/codex-acp).
+> The new adapter is built on the new Codex App Server, and we are pooling implementation
+> and maintenance work across teams there. Use `@agentclientprotocol/codex-acp`
+> for new installs.
+
 Use [Codex](https://github.com/openai/codex) from [ACP-compatible](https://agentclientprotocol.com) clients such as [Zed](https://zed.dev)!
 
 This repository is a fork of the upstream [Zed Codex ACP adapter](https://github.com/zed-industries/codex-acp). It tracks upstream while carrying a small patch stack that exposes selected features from the Codex CLI and Codex desktop/app experience through ACP.
