@@ -24,7 +24,7 @@ describe("Fast mode session config", () => {
     };
 
     async function createSession(
-        currentServiceTier: "fast" | "flex" | null = null,
+        currentServiceTier: "fast" | "priority" | "flex" | null = null,
         clientInfo: acp.Implementation | null = null,
         clientCapabilities?: acp.ClientCapabilities,
     ) {
@@ -33,7 +33,11 @@ describe("Fast mode session config", () => {
         const codexAcpClient = fixture.getCodexAcpClient();
         const fastModel = createTestModel({
             id: "fast-model",
-            additionalSpeedTiers: ["fast"],
+            serviceTiers: [{
+                id: "priority",
+                name: "Fast",
+                description: "1.5x speed, increased usage",
+            }],
         });
         const slowModel = createTestModel({id: "slow-model"});
 
@@ -101,6 +105,13 @@ describe("Fast mode session config", () => {
 
     it("initializes Fast mode as On when the app-server session tier is fast", async () => {
         const {response, codexAcpAgent} = await createSession("fast");
+
+        expect(response.configOptions).toContainEqual(createFastModeConfigOption(true));
+        expect(codexAcpAgent.getSessionState("session-id").fastModeEnabled).toBe(true);
+    });
+
+    it("initializes Fast mode as On when the app-server session tier is priority", async () => {
+        const {response, codexAcpAgent} = await createSession("priority");
 
         expect(response.configOptions).toContainEqual(createFastModeConfigOption(true));
         expect(codexAcpAgent.getSessionState("session-id").fastModeEnabled).toBe(true);
@@ -219,7 +230,7 @@ describe("Fast mode session config", () => {
         await codexAcpAgent.prompt({sessionId: "session-id", prompt: [{type: "text", text: "test"}]});
 
         expect(turnStartSpy).toHaveBeenCalledWith(expect.objectContaining({
-            serviceTier: "fast",
+            serviceTier: "priority",
         }));
     });
 

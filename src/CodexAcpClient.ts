@@ -22,7 +22,6 @@ import type {
     ReasoningEffort,
     ServerNotification
 } from "./app-server";
-import type {ServiceTier} from "./app-server/ServiceTier";
 import type {JsonValue} from "./app-server/serde_json/JsonValue";
 import {ModelId} from "./ModelId";
 import {AgentMode} from "./AgentMode";
@@ -64,6 +63,7 @@ import {
     createUnavailableAgentFileChangeReport,
 } from "./AgentFileChangeReport";
 import {findEnabledSkill, type SkillInvocation} from "./Skills";
+import type {SupportedServiceTier} from "./FastModeConfig";
 
 /**
  * Well-known provider id for the client-configurable custom LLM gateway.
@@ -480,7 +480,7 @@ export class CodexAcpClient {
             models: codexModels,
             collaborationMode: this.getCollaborationMode(response.thread.id),
             modelProvider: response.modelProvider,
-            currentServiceTier: response.serviceTier as ServiceTier ?? null,
+            currentServiceTier: response.serviceTier as SupportedServiceTier ?? null,
             additionalDirectories,
         }
     }
@@ -508,7 +508,7 @@ export class CodexAcpClient {
             models: codexModels,
             collaborationMode: this.getCollaborationMode(response.thread.id),
             modelProvider: response.modelProvider,
-            currentServiceTier: response.serviceTier as ServiceTier ?? null,
+            currentServiceTier: response.serviceTier as SupportedServiceTier ?? null,
             thread: historyResponse.thread,
             additionalDirectories,
         };
@@ -535,7 +535,7 @@ export class CodexAcpClient {
             models: codexModels,
             collaborationMode: this.getCollaborationMode(response.thread.id),
             modelProvider: response.modelProvider,
-            currentServiceTier: response.serviceTier as ServiceTier ?? null,
+            currentServiceTier: response.serviceTier as SupportedServiceTier ?? null,
             additionalDirectories,
         };
     }
@@ -845,7 +845,7 @@ export class CodexAcpClient {
         request: acp.PromptRequest,
         agentMode: AgentMode,
         modelId: ModelId,
-        serviceTier: ServiceTier | null,
+        serviceTier: SupportedServiceTier | null,
         disableSummary: boolean,
         cwd: string,
         additionalDirectories: string[],
@@ -1257,7 +1257,7 @@ export type SessionMetadata = {
     models: Model[],
     collaborationMode: ModeKind,
     modelProvider?: string | null,
-    currentServiceTier?: ServiceTier | null,
+    currentServiceTier?: SupportedServiceTier | null,
     additionalDirectories: string[],
 }
 

@@ -3,19 +3,32 @@ import type * as acp from "@agentclientprotocol/sdk";
 import type {ServiceTier} from "./app-server/ServiceTier";
 import type {Model} from "./app-server/v2";
 
+export type SupportedServiceTier = ServiceTier | "priority";
+
 export const FAST_MODE_CONFIG_ID = "fast-mode";
 export const FAST_MODE_CATEGORY = "model_config";
 export const FAST_MODE_ON = "on";
 export const FAST_MODE_OFF = "off";
 
 const FAST_MODE_DESCRIPTION = "1.5x speed, increased usage";
+const FAST_SERVICE_TIER_ID = "priority";
 
 export function modelSupportsFast(model: Model | undefined): boolean {
-    return model?.additionalSpeedTiers?.includes("fast") ?? false;
+    if (model === undefined) {
+        return false;
+    }
+    if (model.serviceTiers?.length > 0) {
+        return model.serviceTiers.some(tier => tier.id === FAST_SERVICE_TIER_ID);
+    }
+    return model.additionalSpeedTiers?.includes("fast") ?? false;
 }
 
-export function resolveFastServiceTier(fastModeEnabled: boolean, currentModelSupportsFast: boolean): ServiceTier | null {
-    return fastModeEnabled && currentModelSupportsFast ? "fast" : null;
+export function serviceTierEnablesFast(serviceTier: SupportedServiceTier | null | undefined): boolean {
+    return serviceTier === "fast" || serviceTier === FAST_SERVICE_TIER_ID;
+}
+
+export function resolveFastServiceTier(fastModeEnabled: boolean, currentModelSupportsFast: boolean): SupportedServiceTier | null {
+    return fastModeEnabled && currentModelSupportsFast ? FAST_SERVICE_TIER_ID : null;
 }
 
 export function clientSupportsBooleanConfigOptions(clientCapabilities?: acp.ClientCapabilities | null): boolean {
