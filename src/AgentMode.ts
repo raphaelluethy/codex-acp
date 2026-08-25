@@ -53,7 +53,7 @@ export class AgentMode {
     );
     static readonly Agent = new AgentMode(
         "agent",
-        "Approve for me",
+        "Auto",
         "Only ask for actions detected as potentially unsafe",
         "auto_review",
         "on-request",

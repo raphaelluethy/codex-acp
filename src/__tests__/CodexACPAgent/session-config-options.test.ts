@@ -98,7 +98,7 @@ describe("Session config options", () => {
                 },
                 {
                     value: "agent",
-                    name: "Approve for me",
+                    name: "Auto",
                     description: "Only ask for actions detected as potentially unsafe",
                 },
                 {
