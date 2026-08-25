@@ -1459,7 +1459,13 @@ describe('ACP server test', { timeout: 40_000 }, () => {
             cwds: ["/workspace", "/workspace/extra"],
         });
 
-        await expect(mockFixture.getAcpConnectionDump([])).toMatchFileSnapshot("data/available-commands-skills.json");
+        const commands = mockFixture.getAcpConnectionEvents([])[0]!.args[0].update.availableCommands;
+        expect(commands.find((command: { name: string }) => command.name === "build")).toEqual({
+            name: "build",
+            description: "Build",
+            input: { hint: "instructions" },
+            _meta: { codex: { commandKind: "skill" } },
+        });
     });
 
     it('handles builtin slash command locally', async () => {

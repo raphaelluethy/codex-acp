@@ -63,6 +63,7 @@ import {
     createReportedAgentFileChangeReport,
     createUnavailableAgentFileChangeReport,
 } from "./AgentFileChangeReport";
+import {resolveSkillInput} from "./Skills";
 
 /**
  * Well-known provider id for the client-configurable custom LLM gateway.
@@ -707,9 +708,9 @@ export class CodexAcpClient {
     private async refreshSkills(
         cwd: string,
         additionalRoots: string[]
-    ): Promise<void> {
+    ): Promise<SkillsListResponse> {
         if (!cwd) {
-            return;
+            return { data: [] };
         }
 
         const skillExtraRoots = additionalRoots.map(root => path.join(root, ".agents", "skills"));
@@ -717,7 +718,7 @@ export class CodexAcpClient {
             await this.codexClient.skillsExtraRootsSet({ extraRoots: skillExtraRoots });
             this.skillExtraRoots = skillExtraRoots;
         }
-        await this.codexClient.listSkills({
+        return await this.codexClient.listSkills({
             cwds: [cwd, ...additionalRoots],
             forceReload: true,
         });
@@ -851,12 +852,18 @@ export class CodexAcpClient {
         onTurnStarted?: (turnId: string) => void,
         shouldCancel?: () => boolean,
     ): Promise<TurnCompletedNotification | null> {
-        const input = buildPromptItems(request.prompt);
         const effort = modelId.effort as ReasoningEffort | null; //TODO remove unsafe conversion
-        await this.refreshSkills(cwd, additionalDirectories);
+        const skillsResponse = await this.refreshSkills(cwd, additionalDirectories);
         if (shouldCancel?.()) {
             return null;
         }
+        const firstBlock = request.prompt[0];
+        const skillInput = firstBlock?.type === "text"
+            ? resolveSkillInput(firstBlock.text, skillsResponse?.data ?? [])
+            : null;
+        const input = skillInput === null
+            ? buildPromptItems(request.prompt)
+            : [...skillInput, ...buildPromptItems(request.prompt.slice(1))];
         return await this.codexClient.runTurn({
             threadId: request.sessionId,
             input: input,

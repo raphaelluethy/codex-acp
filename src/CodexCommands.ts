@@ -8,6 +8,7 @@ import type {RateLimitsMap} from "./RateLimitsMap";
 import type {TokenCount} from "./TokenCount";
 import {logger} from "./Logger";
 import {createAgentTextMessageChunk} from "./ContentChunks";
+import {buildForkAvailableCommands, tryHandleForkCommand} from "./ForkCommands";
 import {
     COLLABORATION_MODE_CONFIG_ID,
     DEFAULT_COLLABORATION_MODE,
@@ -84,25 +85,7 @@ export class CodexCommands {
     }
 
     private buildAvailableCommands(skillsEntries: SkillsListEntry[]): AvailableCommand[] {
-        const commands = new Map<string, AvailableCommand>();
-
-        for (const builtin of this.getBuiltinCommands()) {
-            commands.set(builtin.name, builtin);
-        }
-
-        for (const entry of skillsEntries) {
-            for (const skill of entry.skills) {
-                const name = `$${skill.name}`;
-                if (commands.has(name)) continue;
-                const description = skill.shortDescription ?? skill.description ?? skill.name;
-                commands.set(name, {
-                    name,
-                    description,
-                    input: null,
-                });
-            }
-        }
-        return Array.from(commands.values());
+        return buildForkAvailableCommands(this.getBuiltinCommands(), skillsEntries);
     }
 
     /**
@@ -204,8 +187,7 @@ export class CodexCommands {
     ): Promise<CommandHandleResult> {
         const command = this.parseCommand(prompt);
         if (command === null) return { handled: false };
-        const commandName = command.name;
-        if (commandName.startsWith("$")) return { handled: false };
+        const commandName = command.name.startsWith("$") ? command.name.slice(1) : command.name;
 
         const sessionId = sessionState.sessionId;
         switch (commandName) {
@@ -272,7 +254,7 @@ export class CodexCommands {
                 const response = await this.runWithProcessCheck(() => this.codexAcpClient.listSkills(this.createSkillsListParams(sessionState)));
                 const skills = (response?.data ?? []).flatMap(entry => entry.skills);
                 const lines = skills.map(skill => {
-                    const description = skill.shortDescription ?? skill.description ?? "";
+                    const description = skill.interface?.shortDescription ?? skill.shortDescription ?? skill.description ?? "";
                     return description ? `- ${skill.name}: ${description}` : `- ${skill.name}`;
                 });
                 const text = lines.length > 0
@@ -301,9 +283,18 @@ export class CodexCommands {
                 return { handled: true };
             }
             default:
-                // Let Codex resolve unrecognized commands as raw prompts.
-                return { handled: false };
+                return await tryHandleForkCommand(commandName, command.rest, {
+                    fastModeEnabled: sessionState.fastModeEnabled,
+                    ...(options.setConfigOption ? {setConfigOption: options.setConfigOption} : {}),
+                    sendAgentText: text => this.sendAgentText(text, sessionId),
+                    sendUsage: (name, hint) => this.sendCommandUsageMessage(name, hint, sessionId),
+                });
         }
+    }
+
+    private async sendAgentText(text: string, sessionId: string): Promise<void> {
+        const session = new ACPSessionConnection(this.connection, sessionId);
+        await session.update(createAgentTextMessageChunk(text));
     }
 
     private async runReviewCommand(

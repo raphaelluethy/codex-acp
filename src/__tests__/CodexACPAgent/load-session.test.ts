@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createCodexMockTestFixture, createTestModel } from "../acp-test-utils";
 import type { Model, Thread, ThreadGoal } from "../../app-server/v2";
+import {createUpstreamCompatibleHistoryDump} from "./fork-command-test-utils";
 
 describe("CodexACPAgent - loadSession", () => {
     it("should replay history during loadSession", async () => {
@@ -231,7 +232,7 @@ describe("CodexACPAgent - loadSession", () => {
             includeTurns: true,
         });
         expect(codexAppServerClient.threadGoalGet).toHaveBeenCalledWith({ threadId: thread.id });
-        await expect(fixture.getAcpConnectionDump([])).toMatchFileSnapshot(
+        await expect(createUpstreamCompatibleHistoryDump(fixture)).toMatchFileSnapshot(
             "data/load-session-history.json"
         );
     });
@@ -576,7 +577,7 @@ describe("CodexACPAgent - loadSession", () => {
                 mcpServers: [],
             });
 
-            await expect(fixture.getAcpConnectionDump([])).toMatchFileSnapshot(
+            await expect(createUpstreamCompatibleHistoryDump(fixture)).toMatchFileSnapshot(
                 "data/load-session-response-item-history-fallback.json",
             );
         } finally {
