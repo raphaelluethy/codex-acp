@@ -8,7 +8,7 @@
         "availableCommands": [
           {
             "name": "plan",
-            "description": "Turn plan mode on.",
+            "description": "Toggle Plan mode for the session.",
             "input": null,
             "_meta": {
               "commandAction": {
@@ -17,29 +17,52 @@
                 "value": "plan",
                 "resetValue": "default",
                 "presentation": "state"
+              },
+              "codex": {
+                "commandKind": "builtin"
               }
             }
           },
           {
             "name": "mcp",
             "description": "List configured Model Context Protocol (MCP) tools.",
-            "input": null
+            "input": null,
+            "_meta": {
+              "codex": {
+                "commandKind": "builtin"
+              }
+            }
           },
           {
             "name": "skills",
             "description": "List available skills.",
-            "input": null
+            "input": null,
+            "_meta": {
+              "codex": {
+                "commandKind": "builtin"
+              }
+            }
           },
           {
             "name": "status",
             "description": "Display session configuration and token usage.",
-            "input": null
+            "input": null,
+            "_meta": {
+              "codex": {
+                "commandKind": "builtin"
+              }
+            }
           },
           {
             "name": "review",
             "description": "Review uncommitted changes, or review with custom instructions.",
             "input": {
               "hint": "optional review instructions"
+            },
+            "_meta": {
+              "codex": {
+                "commandKind": "builtin"
+              }
             }
           },
           {
@@ -47,6 +70,11 @@
             "description": "Review changes relative to a base branch.",
             "input": {
               "hint": "branch name"
+            },
+            "_meta": {
+              "codex": {
+                "commandKind": "builtin"
+              }
             }
           },
           {
@@ -54,12 +82,54 @@
             "description": "Review a specific commit.",
             "input": {
               "hint": "commit sha"
+            },
+            "_meta": {
+              "codex": {
+                "commandKind": "builtin"
+              }
             }
           },
           {
             "name": "compact",
             "description": "Summarize conversation to avoid hitting the context limit.",
-            "input": null
+            "input": null,
+            "_meta": {
+              "codex": {
+                "commandKind": "builtin"
+              }
+            }
+          },
+          {
+            "name": "fast",
+            "description": "Toggle Fast mode to enable fastest inference when available.",
+            "input": {
+              "hint": "on|off|status"
+            },
+            "_meta": {
+              "codex": {
+                "commandKind": "builtin"
+              }
+            }
+          },
+          {
+            "name": "auto-review",
+            "description": "Route approval requests through auto review.",
+            "input": null,
+            "_meta": {
+              "codex": {
+                "commandKind": "builtin"
+              }
+            }
+          },
+          {
+            "name": "manual-review",
+            "description": "Route approval requests to the user.",
+            "input": null,
+            "_meta": {
+              "codex": {
+                "commandKind": "builtin"
+              }
+            }
           },
           {
             "name": "goal",
@@ -71,18 +141,33 @@
               "commandAction": {
                 "kind": "prefixPrompt",
                 "presentation": "state"
+              },
+              "codex": {
+                "commandKind": "builtin"
               }
             }
           },
           {
             "name": "logout",
             "description": "Sign out of Codex. This option is available when you are logged in via ChatGPT.",
-            "input": null
+            "input": null,
+            "_meta": {
+              "codex": {
+                "commandKind": "builtin"
+              }
+            }
           },
           {
-            "name": "$build",
+            "name": "build",
             "description": "Build",
-            "input": null
+            "input": {
+              "hint": "instructions"
+            },
+            "_meta": {
+              "codex": {
+                "commandKind": "skill"
+              }
+            }
           }
         ]
       }

@@ -139,7 +139,7 @@ describeE2E("E2E tests", () => {
 
         const session = await fixture.createSession();
 
-        await fixture.expectAvailableCommand(session.sessionId, "$workspace-skill");
+        await fixture.expectAvailableCommand(session.sessionId, "workspace-skill");
         await fixture.expectPromptText(session.sessionId, "/skills", (text) => {
             expect(text).toContain("Available skills:");
             expect(text).toContain("- workspace-skill: Workspace skill");

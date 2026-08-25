@@ -2,12 +2,15 @@ import type * as acp from "@agentclientprotocol/sdk";
 import type {AvailableCommand} from "@agentclientprotocol/sdk";
 import {ACPSessionConnection, type AcpClientConnection} from "./ACPSessionConnection";
 import type {CodexAcpClient} from "./CodexAcpClient";
-import type {RateLimitSnapshot, ReviewTarget, SkillsListEntry, SkillsListParams, TurnCompletedNotification} from "./app-server/v2";
+import {flattenSkills, normalizeSkillName, type SkillInvocation} from "./Skills";
+import type {RateLimitSnapshot, ReviewTarget, SkillMetadata, SkillsListEntry, SkillsListParams, TurnCompletedNotification} from "./app-server/v2";
 import type {SessionState} from "./CodexAcpServer";
 import type {RateLimitsMap} from "./RateLimitsMap";
 import type {TokenCount} from "./TokenCount";
 import {logger} from "./Logger";
 import {createAgentTextMessageChunk} from "./ContentChunks";
+import {AgentMode, MODE_CONFIG_ID} from "./AgentMode";
+import {FAST_MODE_CONFIG_ID, FAST_MODE_OFF, FAST_MODE_ON} from "./FastModeConfig";
 import {
     COLLABORATION_MODE_CONFIG_ID,
     DEFAULT_COLLABORATION_MODE,
@@ -20,7 +23,9 @@ type ParsedSlashCommand = {
 };
 
 export type CommandHandleResult =
-    | { handled: false, prompt?: acp.ContentBlock[] }
+    | { handled: false, prompt?: never, skill?: never }
+    | { handled: false, prompt: acp.ContentBlock[], skill?: never }
+    | { handled: false, prompt?: never, skill: SkillInvocation }
     | { handled: true, turnCompleted?: TurnCompletedNotification };
 
 export const GOAL_CONTINUATION_PROMPT: acp.ContentBlock[] = [{
@@ -87,20 +92,20 @@ export class CodexCommands {
         const commands = new Map<string, AvailableCommand>();
 
         for (const builtin of this.getBuiltinCommands()) {
-            commands.set(builtin.name, builtin);
+            commands.set(normalizeSkillName(builtin.name), builtin);
         }
 
-        for (const entry of skillsEntries) {
-            for (const skill of entry.skills) {
-                const name = `$${skill.name}`;
-                if (commands.has(name)) continue;
-                const description = skill.shortDescription ?? skill.description ?? skill.name;
-                commands.set(name, {
-                    name,
-                    description,
-                    input: null,
-                });
+        for (const skill of flattenSkills(skillsEntries)) {
+            const normalizedName = normalizeSkillName(skill.name);
+            if (!skill.enabled || !isValidSlashCommandName(skill.name) || commands.has(normalizedName)) {
+                continue;
             }
+            commands.set(normalizedName, {
+                name: skill.name,
+                description: skillDescription(skill),
+                input: { hint: "instructions" },
+                _meta: { codex: { commandKind: "skill" } },
+            });
         }
         return Array.from(commands.values());
     }
@@ -109,10 +114,10 @@ export class CodexCommands {
      * See the original cli commands documentation here: https://developers.openai.com/codex/cli/slash-commands/
      */
     private getBuiltinCommands(): AvailableCommand[] {
-        return [
+        const commands: AvailableCommand[] = [
             {
                 name: "plan",
-                description: "Turn plan mode on.",
+                description: "Toggle Plan mode for the session.",
                 input: null,
                 _meta: {
                     commandAction: {
@@ -160,6 +165,21 @@ export class CodexCommands {
                 input: null
             },
             {
+                name: "fast",
+                description: "Toggle Fast mode to enable fastest inference when available.",
+                input: { hint: "on|off|status" }
+            },
+            {
+                name: "auto-review",
+                description: "Route approval requests through auto review.",
+                input: null
+            },
+            {
+                name: "manual-review",
+                description: "Route approval requests to the user.",
+                input: null
+            },
+            {
                 name: "goal",
                 description: "Set a goal to keep pursuing.",
                 input: { hint: "[<objective>|clear|pause|resume]" },
@@ -176,6 +196,13 @@ export class CodexCommands {
                 input: null
             }
         ];
+        return commands.map(command => ({
+            ...command,
+            _meta: {
+                ...command._meta,
+                codex: { commandKind: "builtin" },
+            },
+        }));
     }
 
     private parseCommand(prompt: acp.ContentBlock[]): ParsedSlashCommand | null {
@@ -204,25 +231,37 @@ export class CodexCommands {
     ): Promise<CommandHandleResult> {
         const command = this.parseCommand(prompt);
         if (command === null) return { handled: false };
-        const commandName = command.name;
-        if (commandName.startsWith("$")) return { handled: false };
+        const commandName = command.name.startsWith("$") ? command.name.slice(1) : command.name;
 
         const sessionId = sessionState.sessionId;
         switch (commandName) {
             case "plan": {
-                if (command.rest.length > 0) {
-                    await this.sendCommandUsageMessage(commandName, "no arguments", sessionId);
+                if (!await this.acceptsNoArguments(commandName, command.rest, sessionId)) {
                     return { handled: true };
                 }
                 const mode = sessionState.collaborationMode === PLAN_COLLABORATION_MODE
                     ? DEFAULT_COLLABORATION_MODE
                     : PLAN_COLLABORATION_MODE;
-                await options.setConfigOption?.(COLLABORATION_MODE_CONFIG_ID, mode);
-                return { handled: options.setConfigOption !== undefined };
+                return this.setConfigOptionCommand(options, COLLABORATION_MODE_CONFIG_ID, mode);
             }
             case "compact": {
                 await this.runWithProcessCheck(() => this.codexAcpClient.runCompact(sessionId));
                 return { handled: true };
+            }
+            case "fast": {
+                return await this.runFastCommand(sessionState, command.rest, options);
+            }
+            case "auto-review": {
+                if (!await this.acceptsNoArguments(commandName, command.rest, sessionId)) {
+                    return { handled: true };
+                }
+                return await this.setConfigOptionCommand(options, MODE_CONFIG_ID, AgentMode.Agent.id);
+            }
+            case "manual-review": {
+                if (!await this.acceptsNoArguments(commandName, command.rest, sessionId)) {
+                    return { handled: true };
+                }
+                return await this.setConfigOptionCommand(options, MODE_CONFIG_ID, AgentMode.ReadOnly.id);
             }
             case "goal": {
                 return await this.runGoalCommand(sessionState, command.rest, options);
@@ -256,30 +295,26 @@ export class CodexCommands {
                 return { handled: true, turnCompleted };
             }
             case "status": {
-                const session = new ACPSessionConnection(this.connection, sessionId);
-                const message = this.buildStatusMessage(sessionState);
-                await session.update(createAgentTextMessageChunk(message));
+                await this.sendAgentText(this.buildStatusMessage(sessionState), sessionId);
                 return { handled: true };
             }
             case "logout": {
                 await this.runWithProcessCheck(() => this.codexAcpClient.logout());
                 await this.onLogout();
-                const session = new ACPSessionConnection(this.connection, sessionId);
-                await session.update(createAgentTextMessageChunk("Logged out from Codex account."));
+                await this.sendAgentText("Logged out from Codex account.", sessionId);
                 return { handled: true };
             }
             case "skills": {
                 const response = await this.runWithProcessCheck(() => this.codexAcpClient.listSkills(this.createSkillsListParams(sessionState)));
-                const skills = (response?.data ?? []).flatMap(entry => entry.skills);
+                const skills = flattenSkills(response?.data ?? []);
                 const lines = skills.map(skill => {
-                    const description = skill.shortDescription ?? skill.description ?? "";
+                    const description = skillDescription(skill);
                     return description ? `- ${skill.name}: ${description}` : `- ${skill.name}`;
                 });
                 const text = lines.length > 0
                     ? ["Available skills:", ...lines].join("\n")
                     : "No skills configured.";
-                const session = new ACPSessionConnection(this.connection, sessionId);
-                await session.update(createAgentTextMessageChunk(text));
+                await this.sendAgentText(text, sessionId);
                 return { handled: true };
             }
             case "mcp": {
@@ -296,14 +331,67 @@ export class CodexCommands {
                 const text = lines.length > 0
                     ? ["Configured MCP servers:", ...lines].join("\n")
                     : "No MCP servers configured.";
-                const session = new ACPSessionConnection(this.connection, sessionId);
-                await session.update(createAgentTextMessageChunk(text));
+                await this.sendAgentText(text, sessionId);
                 return { handled: true };
             }
-            default:
-                // Let Codex resolve unrecognized commands as raw prompts.
-                return { handled: false };
+            default: {
+                if (!isValidSlashCommandName(commandName)) {
+                    return { handled: false };
+                }
+                return {
+                    handled: false,
+                    skill: { name: commandName, instructions: command.rest },
+                };
+            }
         }
+    }
+
+    private async setConfigOptionCommand(
+        options: CommandHandleOptions,
+        configId: string,
+        value: string,
+    ): Promise<CommandHandleResult> {
+        await options.setConfigOption?.(configId, value);
+        if (options.setConfigOption === undefined) {
+            return { handled: false };
+        }
+        return { handled: true };
+    }
+
+    private async runFastCommand(
+        sessionState: SessionState,
+        rest: string,
+        options: CommandHandleOptions,
+    ): Promise<CommandHandleResult> {
+        const argument = rest.trim().toLowerCase();
+        if (argument === "status") {
+            const state = sessionState.fastModeEnabled ? FAST_MODE_ON : FAST_MODE_OFF;
+            await this.sendAgentText(`Fast mode is ${state}.`, sessionState.sessionId);
+            return { handled: true };
+        }
+
+        let enabled: boolean;
+        if (argument.length === 0) {
+            enabled = !sessionState.fastModeEnabled;
+        } else if (argument === FAST_MODE_ON) {
+            enabled = true;
+        } else if (argument === FAST_MODE_OFF) {
+            enabled = false;
+        } else {
+            await this.sendCommandUsageMessage("fast", "on|off|status", sessionState.sessionId);
+            return { handled: true };
+        }
+
+        return this.setConfigOptionCommand(
+            options,
+            FAST_MODE_CONFIG_ID,
+            enabled ? FAST_MODE_ON : FAST_MODE_OFF,
+        );
+    }
+
+    private async sendAgentText(text: string, sessionId: string): Promise<void> {
+        const session = new ACPSessionConnection(this.connection, sessionId);
+        await session.update(createAgentTextMessageChunk(text));
     }
 
     private async runReviewCommand(
@@ -351,8 +439,7 @@ export class CodexCommands {
         }
 
         if (argument.length > 4000) {
-            const session = new ACPSessionConnection(this.connection, sessionId);
-            await session.update(createAgentTextMessageChunk('Command "/goal" requires goal text of at most 4000 characters.'));
+            await this.sendAgentText('Command "/goal" requires goal text of at most 4000 characters.', sessionId);
             return { handled: true };
         }
 
@@ -400,8 +487,15 @@ export class CodexCommands {
     }
 
     private async sendCommandUsageMessage(name: string, inputHint: string, sessionId: string): Promise<void> {
-        const session = new ACPSessionConnection(this.connection, sessionId);
-        await session.update(createAgentTextMessageChunk(`Command "/${name}" requires ${inputHint}.`));
+        await this.sendAgentText(`Command "/${name}" requires ${inputHint}.`, sessionId);
+    }
+
+    private async acceptsNoArguments(name: string, rest: string, sessionId: string): Promise<boolean> {
+        if (rest.length === 0) {
+            return true;
+        }
+        await this.sendCommandUsageMessage(name, "no arguments", sessionId);
+        return false;
     }
 
     private buildStatusMessage(sessionState: SessionState): string {
@@ -557,4 +651,10 @@ export class CodexCommands {
     }
 }
 
-type ParsedCommand = { name: string; };
+function isValidSlashCommandName(name: string): boolean {
+    return name.length > 0 && !/[\s/]/.test(name);
+}
+
+function skillDescription(skill: SkillMetadata): string {
+    return skill.interface?.shortDescription ?? skill.shortDescription ?? skill.description;
+}

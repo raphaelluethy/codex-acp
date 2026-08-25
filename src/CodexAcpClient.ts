@@ -63,6 +63,7 @@ import {
     createReportedAgentFileChangeReport,
     createUnavailableAgentFileChangeReport,
 } from "./AgentFileChangeReport";
+import {findEnabledSkill, type SkillInvocation} from "./Skills";
 
 /**
  * Well-known provider id for the client-configurable custom LLM gateway.
@@ -707,9 +708,9 @@ export class CodexAcpClient {
     private async refreshSkills(
         cwd: string,
         additionalRoots: string[]
-    ): Promise<void> {
+    ): Promise<SkillsListResponse> {
         if (!cwd) {
-            return;
+            return { data: [] };
         }
 
         const skillExtraRoots = additionalRoots.map(root => path.join(root, ".agents", "skills"));
@@ -717,7 +718,7 @@ export class CodexAcpClient {
             await this.codexClient.skillsExtraRootsSet({ extraRoots: skillExtraRoots });
             this.skillExtraRoots = skillExtraRoots;
         }
-        await this.codexClient.listSkills({
+        return await this.codexClient.listSkills({
             cwds: [cwd, ...additionalRoots],
             forceReload: true,
         });
@@ -850,12 +851,31 @@ export class CodexAcpClient {
         additionalDirectories: string[],
         onTurnStarted?: (turnId: string) => void,
         shouldCancel?: () => boolean,
+        skillInvocation?: SkillInvocation,
     ): Promise<TurnCompletedNotification | null> {
-        const input = buildPromptItems(request.prompt);
         const effort = modelId.effort as ReasoningEffort | null; //TODO remove unsafe conversion
-        await this.refreshSkills(cwd, additionalDirectories);
+        const skillsResponse = await this.refreshSkills(cwd, additionalDirectories);
         if (shouldCancel?.()) {
             return null;
+        }
+        let input: UserInput[];
+        if (skillInvocation !== undefined) {
+            const skill = findEnabledSkill(skillsResponse.data, skillInvocation.name);
+            if (skill !== null) {
+                input = [
+                    {
+                        type: "text",
+                        text: skillPromptText(skill.name, skillInvocation.instructions),
+                        text_elements: [],
+                    },
+                    { type: "skill", name: skill.name, path: skill.path },
+                    ...buildPromptItems(request.prompt.slice(1)),
+                ];
+            } else {
+                input = buildPromptItems(request.prompt);
+            }
+        } else {
+            input = buildPromptItems(request.prompt);
         }
         return await this.codexClient.runTurn({
             threadId: request.sessionId,
@@ -1275,6 +1295,10 @@ function buildPromptItems(prompt: acp.ContentBlock[]): UserInput[] {
                 return null;
         }
     }).filter((block): block is UserInput => block !== null);
+}
+
+function skillPromptText(name: string, instructions: string): string {
+    return instructions.length > 0 ? `$${name} ${instructions}` : `$${name}`;
 }
 
 function imageDataUrl(block: acp.ContentBlock & { type: "image" }): string {

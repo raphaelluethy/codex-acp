@@ -1462,6 +1462,91 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         await expect(mockFixture.getAcpConnectionDump([])).toMatchFileSnapshot("data/available-commands-skills.json");
     });
 
+    it('reserves builtin command names case-insensitively for advertising and invocation', async () => {
+        const { mockFixture, sessionState, turnStartSpy } = setupPromptFixture({
+            fastModeEnabled: false,
+            currentModelSupportsFast: true,
+        });
+        vi.spyOn(mockFixture.getCodexAppServerClient(), "listSkills").mockResolvedValue({
+            data: [{
+                cwd: "/workspace",
+                skills: [{
+                    name: "FAST",
+                    description: "A conflicting skill",
+                    path: "/tmp/fast/SKILL.md",
+                    scope: "user",
+                    enabled: true,
+                }],
+                errors: [],
+            }],
+        });
+
+        // @ts-expect-error - exercising private helper
+        await mockFixture.getCodexAcpAgent().availableCommands.publish(sessionState);
+        const availableCommands = mockFixture.getAcpConnectionEvents([])[0]!.args[0].update.availableCommands;
+        expect(availableCommands.filter((command: { name: string }) => command.name.toLowerCase() === "fast"))
+            .toHaveLength(1);
+
+        await mockFixture.getCodexAcpAgent().prompt({
+            sessionId: "session-id",
+            prompt: [{ type: "text", text: "/$FAST" }],
+        });
+
+        expect(sessionState.fastModeEnabled).toBe(true);
+        expect(turnStartSpy).not.toHaveBeenCalled();
+    });
+
+    it('publishes and invokes only the first duplicate enabled skill', async () => {
+        const { mockFixture, sessionState, turnStartSpy } = setupPromptFixture();
+        vi.spyOn(mockFixture.getCodexAppServerClient(), "listSkills").mockResolvedValue({
+            data: [
+                {
+                    cwd: "/workspace",
+                    skills: [{
+                        name: "diagnose",
+                        description: "First definition",
+                        path: "/tmp/first/SKILL.md",
+                        scope: "user",
+                        enabled: true,
+                    }],
+                    errors: [],
+                },
+                {
+                    cwd: "/workspace/extra",
+                    skills: [{
+                        name: "DIAGNOSE",
+                        description: "Duplicate definition",
+                        path: "/tmp/second/SKILL.md",
+                        scope: "user",
+                        enabled: true,
+                    }],
+                    errors: [],
+                },
+            ],
+        });
+
+        // @ts-expect-error - exercising private helper
+        await mockFixture.getCodexAcpAgent().availableCommands.publish(sessionState);
+        const availableCommands = mockFixture.getAcpConnectionEvents([])[0]!.args[0].update.availableCommands;
+        expect(availableCommands.filter((command: { name: string }) => command.name.toLowerCase() === "diagnose"))
+            .toEqual([expect.objectContaining({
+                name: "diagnose",
+                description: "First definition",
+                _meta: { codex: { commandKind: "skill" } },
+            })]);
+
+        await mockFixture.getCodexAcpAgent().prompt({
+            sessionId: "session-id",
+            prompt: [{ type: "text", text: "/DIAGNOSE investigate" }],
+        });
+        expect(turnStartSpy).toHaveBeenCalledWith(expect.objectContaining({
+            input: [
+                { type: "text", text: "$diagnose investigate", text_elements: [] },
+                { type: "skill", name: "diagnose", path: "/tmp/first/SKILL.md" },
+            ],
+        }));
+    });
+
     it('handles builtin slash command locally', async () => {
         const mockFixture = createCodexMockTestFixture();
         const codexAcpAgent = mockFixture.getCodexAcpAgent();
@@ -1473,8 +1558,9 @@ describe('ACP server test', { timeout: 40_000 }, () => {
         await expect(mockFixture.getAcpConnectionDump([])).toMatchFileSnapshot("data/command-status.json");
     });
 
-    it('passes skill slash commands through to Codex', async () => {
+    it('passes unknown skill slash commands through to Codex', async () => {
         const { mockFixture, turnStartSpy } = setupPromptFixture();
+        const listSkillsSpy = vi.spyOn(mockFixture.getCodexAppServerClient(), "listSkills").mockResolvedValue({ data: [] });
 
         await mockFixture.getCodexAcpAgent().prompt({
             sessionId: "session-id",
@@ -1488,7 +1574,149 @@ describe('ACP server test', { timeout: 40_000 }, () => {
                 text_elements: []
             }]
         }));
+        expect(listSkillsSpy).toHaveBeenCalledTimes(1);
         expect(mockFixture.getAcpConnectionDump([])).toBe("");
+    });
+
+    it('invokes enabled skills as structured Codex skill input without dropping attachments', async () => {
+        const { mockFixture, turnStartSpy } = setupPromptFixture();
+        const listSkillsSpy = vi.spyOn(mockFixture.getCodexAppServerClient(), "listSkills").mockResolvedValue({
+            data: [{
+                cwd: "/workspace",
+                skills: [{
+                    name: "diagnose",
+                    description: "Debug a bug",
+                    path: "/tmp/diagnose/SKILL.md",
+                    scope: "user",
+                    enabled: true,
+                }],
+                errors: [],
+            }],
+        });
+
+        await mockFixture.getCodexAcpAgent().prompt({
+            sessionId: "session-id",
+            prompt: [
+                { type: "text", text: "/diagnose failing test" },
+                { type: "resource_link", name: "report.txt", uri: "file:///tmp/report.txt" },
+            ],
+        });
+
+        expect(turnStartSpy).toHaveBeenCalledWith(expect.objectContaining({
+            input: [
+                { type: "text", text: "$diagnose failing test", text_elements: [] },
+                { type: "skill", name: "diagnose", path: "/tmp/diagnose/SKILL.md" },
+                { type: "text", text: "[@report.txt](file:///tmp/report.txt)", text_elements: [] },
+            ],
+        }));
+        expect(listSkillsSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('invokes $-prefixed skill slash commands as structured Codex skill input', async () => {
+        const { mockFixture, turnStartSpy } = setupPromptFixture();
+        vi.spyOn(mockFixture.getCodexAppServerClient(), "listSkills").mockResolvedValue({
+            data: [{
+                cwd: "/workspace",
+                skills: [{
+                    name: "imagegen",
+                    description: "Generate an image",
+                    path: "/tmp/imagegen/SKILL.md",
+                    scope: "user",
+                    enabled: true,
+                }],
+                errors: [],
+            }],
+        });
+
+        await mockFixture.getCodexAcpAgent().prompt({
+            sessionId: "session-id",
+            prompt: [{ type: "text", text: "/$imagegen create a hero image" }],
+        });
+
+        expect(turnStartSpy).toHaveBeenCalledWith(expect.objectContaining({
+            input: [
+                { type: "text", text: "$imagegen create a hero image", text_elements: [] },
+                { type: "skill", name: "imagegen", path: "/tmp/imagegen/SKILL.md" },
+            ],
+        }));
+    });
+
+    it('passes skill slash commands through as a raw prompt when the session cwd is empty', async () => {
+        const { mockFixture, turnStartSpy } = setupPromptFixture({ cwd: "" });
+
+        await expect(mockFixture.getCodexAcpAgent().prompt({
+            sessionId: "session-id",
+            prompt: [{ type: "text", text: "/diagnose failing test" }],
+        })).resolves.toMatchObject({ stopReason: "end_turn" });
+
+        expect(turnStartSpy).toHaveBeenCalledWith(expect.objectContaining({
+            input: [{
+                type: "text",
+                text: "/diagnose failing test",
+                text_elements: [],
+            }],
+        }));
+    });
+
+    it.each([
+        { command: "/fast", initial: false, expected: true, message: undefined },
+        { command: "/fast off", initial: true, expected: false, message: undefined },
+        { command: "/fast status", initial: true, expected: true, message: "Fast mode is on." },
+        { command: "/fast quickly", initial: false, expected: false, message: 'Command "/fast" requires on|off|status.' },
+    ])('handles $command without starting a turn', async ({ command, initial, expected, message }) => {
+        const { mockFixture, sessionState, turnStartSpy } = setupPromptFixture({
+            fastModeEnabled: initial,
+            currentModelSupportsFast: true,
+        });
+
+        await mockFixture.getCodexAcpAgent().prompt({
+            sessionId: "session-id",
+            prompt: [{ type: "text", text: command }],
+        });
+
+        expect(sessionState.fastModeEnabled).toBe(expected);
+        expect(turnStartSpy).not.toHaveBeenCalled();
+        const messages = mockFixture.getAcpConnectionEvents([])
+            .filter(event => event.args[0]?.update?.sessionUpdate === "agent_message_chunk")
+            .map(event => event.args[0].update.content.text);
+        expect(messages).toEqual(message === undefined ? [] : [message]);
+    });
+
+    it('routes /auto-review and /manual-review through session modes', async () => {
+        const { mockFixture, sessionState, turnStartSpy } = setupPromptFixture({
+            agentMode: AgentMode.ReadOnly,
+        });
+
+        await mockFixture.getCodexAcpAgent().prompt({
+            sessionId: "session-id",
+            prompt: [{ type: "text", text: "/auto-review" }],
+        });
+        expect(sessionState.agentMode).toBe(AgentMode.Agent);
+
+        await mockFixture.getCodexAcpAgent().prompt({
+            sessionId: "session-id",
+            prompt: [{ type: "text", text: "/manual-review" }],
+        });
+        expect(sessionState.agentMode).toBe(AgentMode.ReadOnly);
+        expect(turnStartSpy).not.toHaveBeenCalled();
+    });
+
+    it.each([
+        { command: "/auto-review now", initialMode: AgentMode.ReadOnly },
+        { command: "/manual-review now", initialMode: AgentMode.Agent },
+    ])('rejects arguments for $command without changing mode or starting a turn', async ({ command, initialMode }) => {
+        const { mockFixture, sessionState, turnStartSpy } = setupPromptFixture({ agentMode: initialMode });
+
+        await mockFixture.getCodexAcpAgent().prompt({
+            sessionId: "session-id",
+            prompt: [{ type: "text", text: command }],
+        });
+
+        expect(sessionState.agentMode).toBe(initialMode);
+        expect(turnStartSpy).not.toHaveBeenCalled();
+        const [event] = mockFixture.getAcpConnectionEvents([]);
+        expect(event!.args[0].update.content.text)
+            .toBe(`Command "/${command.slice(1).split(" ")[0]}" requires no arguments.`);
     });
 
     it('handles review slash commands through Codex app server', async () => {
